@@ -709,7 +709,7 @@ var A = {
   showBoxes: false,
   ink: "Green",
   rightPane: "pages",
-  running: false, cancelled: false, worker: null,
+  running: false, cancelled: false, pool: null, poolPromise: null,
   ocrQueue: [],              // tab ids waiting for OCR
   findMatches: [], findIdx: -1, findQuery: "",
   signature: null,           // dataURL PNG of the saved signature
@@ -2166,29 +2166,71 @@ function wordsFromData(data, canvasW, canvasH){
   }
   return [];
 }
-var progressBase = 0, progressSpan = 100;
-async function getWorker(){
-  if (A.worker) return A.worker;
-  if (typeof Tesseract === "undefined") throw new Error("The reading engine library did not load. Check your connection and try again.");
-  setProgress(2, "Loading the reading engine and English data (first run only)…");
-  $("engineStatus").textContent = "Reader: loading…";
-  var worker = await Tesseract.createWorker("eng", 1, {
+/* ============ reader pool + fast model ============
+   Pages are read by a small pool of Tesseract workers running in
+   parallel instead of one worker reading page after page. The pool
+   size follows the device: more cores (and memory) → more readers,
+   capped at 4, never under 2.
+   The workers load the "fast" English model (tessdata_fast) instead
+   of the bigger "best" model Tesseract uses by default — measured on
+   engineering drawings it found slightly more words, and it reads
+   noticeably quicker. cachePath namespaces the browser's model cache:
+   Tesseract keys that cache by language alone, so without this a
+   browser that already cached the old "best" model would keep using
+   it and never pick up the fast one. */
+var OCR_LANG_PATH = "https://cdn.jsdelivr.net/gh/naptha/tessdata@gh-pages/4.0.0_fast";
+var OCR_CACHE_PATH = "ptr-ocr-fast";
+var POOL_SIZE = (function(){
+  var cores = (typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 4;
+  var memGb = (typeof navigator !== "undefined" && navigator.deviceMemory) || 4;
+  var n = cores >= 8 ? 4 : cores >= 4 ? 3 : 2;
+  if (memGb <= 2) n = Math.min(n, 2);
+  else if (memGb <= 4) n = Math.min(n, 3);
+  return n;
+})();
+/* One pool slot: a worker plus the progress callback of the page it is
+   reading right now (fed by that worker's logger). */
+function makeSlot(){
+  var slot = { worker: null, onProgress: null };
+  return Tesseract.createWorker("eng", 1, {
+    langPath: OCR_LANG_PATH,
+    cachePath: OCR_CACHE_PATH,
     logger: function(m){
       if (A.cancelled) return;
-      if (m.status === "recognizing text"){
-        setProgress(progressBase + m.progress * progressSpan,
-          "Reading… " + Math.round(progressBase + m.progress * progressSpan) + "%");
-      } else if (m.status){
-        setProgress(Math.max(2, progressBase), m.status + "…");
-      }
+      if (m.status === "recognizing text" && slot.onProgress) slot.onProgress(m.progress || 0);
     }
-  });
-  A.worker = worker;
-  $("engineStatus").textContent = "Reader: ready";
-  return worker;
+  }).then(function(worker){ slot.worker = worker; return slot; });
 }
-async function ocrCanvas(canvas, psm, dictOn){
-  var worker = await getWorker();
+/* Build the pool once and reuse it for every file and page. Workers are
+   created one after another so the first one downloads the model and
+   the rest pick it up from the browser cache. */
+async function getPool(){
+  if (A.pool) return A.pool;
+  if (A.poolPromise) return A.poolPromise;
+  if (typeof Tesseract === "undefined") throw new Error("The reading engine library did not load. Check your connection and try again.");
+  $("engineStatus").textContent = "Reader: loading…";
+  A.poolPromise = (async function(){
+    var slots = [];
+    try {
+      for (var i = 0; i < POOL_SIZE; i++){
+        if (A.cancelled) throw new Error("cancelled");
+        if (!slots.length) setProgress(2, "Loading the reading engine and English data (first run only)…");
+        slots.push(await makeSlot());
+      }
+    } catch (e){
+      await Promise.all(slots.map(function(s){ return s.worker ? s.worker.terminate().catch(function(){}) : null; }));
+      throw e;
+    }
+    A.pool = slots;
+    $("engineStatus").textContent = "Reader: ready";
+    return slots;
+  })();
+  try { return await A.poolPromise; }
+  catch (e){ A.poolPromise = null; throw e; }
+}
+/* Read one prepared canvas on one pool worker. report(f) receives this
+   pass's progress, 0..1, which the caller maps into the page's span. */
+async function ocrCanvas(slot, canvas, psm, dictOn, report){
   var params = {
     tessedit_pageseg_mode: String(psm),
     preserve_interword_spaces: "1"
@@ -2197,8 +2239,14 @@ async function ocrCanvas(canvas, psm, dictOn){
     params.load_system_dawg = "0";
     params.load_freq_dawg = "0";
   }
-  try { await worker.setParameters(params); } catch (e) {}
-  var result = await worker.recognize(canvas, {}, { text: true, tsv: true });
+  try { await slot.worker.setParameters(params); } catch (e) {}
+  slot.onProgress = report || null;
+  var result;
+  try {
+    result = await slot.worker.recognize(canvas, {}, { text: true, tsv: true });
+  } finally {
+    slot.onProgress = null;
+  }
   if (A.cancelled) throw new Error("cancelled");
   return wordsFromData(result.data, canvas.width, canvas.height);
 }
@@ -2210,8 +2258,11 @@ async function renderPdfPageAt(t, pageNum, scale){
   await page.render({ canvasContext: canvas.getContext("2d"), viewport: viewport }).promise;
   return canvas;
 }
-/* Read one page of a tab with the bench pipeline. Returns {words, source}. */
-async function ocrTabPage(t, pageNum, pageFrac){
+/* Read one page of a tab with the bench pipeline — same presets, same
+   preprocessing, same passes, same merge and corrections as always.
+   Runs on one pool slot; report(f) tracks this page's progress 0..1.
+   Returns {words, source}. */
+async function ocrTabPage(t, pageNum, slot, report){
   var preset = PRESETS[A.preset];
   var pageIdx = pageNum - 1;
   var native = { words: [], coverage: 0 };
@@ -2245,9 +2296,10 @@ async function ocrTabPage(t, pageNum, pageFrac){
   if (preset.psm2) passList.push(preset.psm2);
   var passWords = [];
   for (var pi = 0; pi < passList.length; pi++){
-    progressBase = (pageFrac + (pi / (passList.length + 0.6)) / Math.max(1, t.numPages)) * 100;
-    progressSpan = (1 / (passList.length + 0.6)) / Math.max(1, t.numPages) * 100;
-    var w = await ocrCanvas(prep.canvas, passList[pi], preset.dict);
+    var passBase = pi / (passList.length + 0.6), passSpan = 1 / (passList.length + 0.6);
+    var w = await ocrCanvas(slot, prep.canvas, passList[pi], preset.dict, function(f){
+      report(passBase + f * passSpan);
+    });
     logLine("&nbsp;&nbsp;Page " + pageNum + " pass " + (pi+1) + " (mode " + passList[pi] + ") → " + w.length + " words.");
     passWords.push(w);
   }
@@ -2262,8 +2314,9 @@ async function ocrTabPage(t, pageNum, pageFrac){
     var fbPrep = preprocess(workCanvas, { binarize: true, upscale: true });
     var fbWords = [];
     for (var fi = 0; fi < passList.length; fi++){
-      progressBase = (pageFrac + 0.85 / Math.max(1, t.numPages)) * 100; progressSpan = 10 / Math.max(1, t.numPages);
-      var fw = await ocrCanvas(fbPrep.canvas, passList[fi], preset.dict);
+      var fw = await ocrCanvas(slot, fbPrep.canvas, passList[fi], preset.dict, function(f){
+        report(0.85 + f * 0.1);
+      });
       fbWords.push(fw);
     }
     var before = merged.length;
@@ -2316,20 +2369,52 @@ async function runOcrTab(t){
   logLine("<b>File:</b> " + esc(t.name) + " · " + t.numPages + (t.numPages === 1 ? " page" : " pages"));
   logLine("<b>Preset:</b> " + esc(preset.label) + " — " + esc(preset.desc));
   try {
-    for (var p = 1; p <= t.numPages; p++){
-      if (A.cancelled) throw new Error("cancelled");
-      if (t.editedPages[p - 1]){
-        logLine("<b>Page " + p + ":</b> you edited this page by hand — reading skipped so your edits are kept.");
-        continue;
+    var slots = await getPool();
+    /* Reading order: the page on screen goes first, so it is readable
+       almost immediately; the pool then works through the remaining
+       pages in the background, in document order. Pages edited by hand
+       are skipped, as before, so the edits are kept. Each pool worker
+       pulls the next page as soon as it finishes one, so several pages
+       are always being read at once. */
+    var startPage = clamp(t.pageNum, 1, t.numPages);
+    var order = [startPage];
+    for (var p = 1; p <= t.numPages; p++) if (p !== startPage) order.push(p);
+    var fracs = {}, todo = [];
+    order.forEach(function(pg){
+      if (t.editedPages[pg - 1]){
+        logLine("<b>Page " + pg + ":</b> you edited this page by hand — reading skipped so your edits are kept.");
+        fracs[pg] = 1;
+      } else { fracs[pg] = 0; todo.push(pg); }
+    });
+    var doneCount = order.length - todo.length; /* hand-edited pages count as already done */
+    var updateProgress = function(){
+      var sum = 0;
+      for (var pg = 1; pg <= t.numPages; pg++) sum += fracs[pg] || 0;
+      var pct = t.numPages ? (sum / t.numPages) * 100 : 100;
+      setProgress(pct, "Reading… " + Math.round(pct) + "% · " + doneCount + " of " + t.numPages + (t.numPages === 1 ? " page" : " pages") + " done");
+    };
+    updateProgress();
+    var cursor = 0, firstError = null;
+    var runSlot = async function(slot){
+      while (!firstError && !A.cancelled && cursor < todo.length){
+        var pageNum = todo[cursor++];
+        try {
+          var res = await ocrTabPage(t, pageNum, slot, function(f){
+            if (f > (fracs[pageNum] || 0)){ fracs[pageNum] = f; updateProgress(); }
+          });
+          t.pagesWords[pageNum - 1] = res.words;
+          t.pagesSource[pageNum - 1] = res.source;
+          t.pagesLines[pageNum - 1] = res.lines || groupLines(res.words);
+          t.corrections[pageNum - 1] = res.corrections || [];
+          fracs[pageNum] = 1; doneCount++;
+          updateProgress();
+          if (tab() === t) renderViewer();
+        } catch (err){ if (!firstError) firstError = err; }
       }
-      setProgress(((p - 1) / t.numPages) * 100, "Reading page " + p + " of " + t.numPages + "…");
-      var res = await ocrTabPage(t, p, (p - 1) / t.numPages);
-      t.pagesWords[p - 1] = res.words;
-      t.pagesSource[p - 1] = res.source;
-      t.pagesLines[p - 1] = res.lines || groupLines(res.words);
-      t.corrections[p - 1] = res.corrections || [];
-      if (tab() === t) renderViewer();
-    }
+    };
+    await Promise.all(slots.map(runSlot));
+    if (firstError) throw firstError;
+    if (A.cancelled) throw new Error("cancelled");
     t.ocrDone = true;
     var totalWords = Object.keys(t.pagesWords).reduce(function(s, k){ return s + t.pagesWords[k].length; }, 0);
     var elapsed = performance.now() - t0;
@@ -2363,7 +2448,11 @@ async function runOcrTab(t){
 $("ocrCancel").addEventListener("click", async function(){
   A.cancelled = true;
   status("Stopping the reading…");
-  if (A.worker){ try { await A.worker.terminate(); } catch(e){} A.worker = null; }
+  var slots = A.pool || [];
+  A.pool = null; A.poolPromise = null;
+  await Promise.all(slots.map(function(s){
+    return s.worker ? s.worker.terminate().catch(function(){}) : null;
+  }));
   A.ocrQueue = [];
 });
 $("ocrStart").addEventListener("click", function(){
