@@ -1759,8 +1759,14 @@ $("viewerWrap").addEventListener("wheel", function(e){
    the pointer-based pinch below zooms the document instead. */
 document.addEventListener("gesturestart", function(e){ e.preventDefault(); });
 document.addEventListener("gesturechange", function(e){ e.preventDefault(); });
-/* Touch pinch on the document: the pages scale live under the fingers via a
-   CSS transform, then the zoom commits and the pages re-render sharp. */
+document.addEventListener("gestureend", function(e){ e.preventDefault(); });
+/* Touch pinch on the document — two stages, both required:
+   1) LIVE PREVIEW while the fingers move: the pages scale under the
+      fingers with a CSS transform (cheap; no re-render yet).
+   2) COMMIT when a finger lifts (commitPinchZoom below): the preview
+      transform comes off, the new zoom is applied to the tab, the pages
+      re-render sharp at that zoom, and the scroll position is restored
+      so the pinch centre stays at the same place on screen. */
 var pinchPts = new Map(), pinch = null;
 function pinchList(){ return Array.from(pinchPts.values()); }
 function pinchDist(){ var p = pinchList(); return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y); }
@@ -1768,16 +1774,20 @@ $("viewerScroll").addEventListener("pointerdown", function(e){
   if (e.pointerType !== "touch") return;
   pinchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pinchPts.size === 2){
-    var t = tab(); if (!t) return;
+    var t = tab(); if (!t){ pinch = null; return; }
     var p = pinchList(), pages = $("viewerPages"), wrap = $("viewerScroll");
     var mid = { x: (p[0].x + p[1].x) / 2, y: (p[0].y + p[1].y) / 2 };
     var r = pages.getBoundingClientRect(), wr = wrap.getBoundingClientRect();
-    var ox = mid.x - r.left, oy = mid.y - r.top;
     pinch = {
-      d0: Math.max(20, pinchDist()), z0: currentZoomFactor(t), ratio: 1,
-      ox: ox, oy: oy,
-      fx: (wrap.scrollLeft + (r.left - wr.left) + ox) / Math.max(1, wrap.scrollWidth),
-      fy: (wrap.scrollTop + (r.top - wr.top) + oy) / Math.max(1, wrap.scrollHeight)
+      d0: Math.max(20, pinchDist()),   /* finger distance when the pinch began */
+      z0: currentZoomFactor(t),       /* zoom on screen when the pinch began */
+      ratio: 1,                       /* live preview scale, updated on every move */
+      ox: mid.x - r.left,             /* pinch centre inside the pages: the */
+      oy: mid.y - r.top,              /* transform origin for the preview */
+      vx: mid.x - wr.left,            /* pinch centre inside the viewport: the */
+      vy: mid.y - wr.top,             /* spot it must return to after commit */
+      fx: (wrap.scrollLeft + (mid.x - wr.left)) / Math.max(1, wrap.scrollWidth),
+      fy: (wrap.scrollTop + (mid.y - wr.top)) / Math.max(1, wrap.scrollHeight)
     };
     dragState = null; /* a second finger cancels any tool drag in progress */
   }
@@ -1786,28 +1796,39 @@ $("viewerScroll").addEventListener("pointermove", function(e){
   if (!pinchPts.has(e.pointerId)) return;
   pinchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pinch && pinchPts.size === 2){
+    /* LIVE PREVIEW: scale the pages under the fingers via a CSS transform.
+       The real zoom is only applied in the commit step when the pinch ends. */
     pinch.ratio = clamp(pinchDist() / pinch.d0, 0.2, 5);
     var pages = $("viewerPages");
     pages.style.transformOrigin = pinch.ox + "px " + pinch.oy + "px";
     pages.style.transform = "scale(" + pinch.ratio + ")";
   }
 });
-async function endPinch(e){
+/* COMMIT — runs when either finger lifts (or the gesture is cancelled).
+   Ends the preview, applies the new zoom, re-renders the pages sharp at
+   that zoom, then scrolls so the pinch centre is back under the fingers. */
+async function commitPinchZoom(e){
   if (e && e.pointerId != null) pinchPts.delete(e.pointerId);
-  if (!pinch || pinchPts.size >= 2) return;
+  if (!pinch || pinchPts.size >= 2) return;   /* both fingers still down */
   var p = pinch; pinch = null;
+  /* 1) end the live preview */
   var pages = $("viewerPages");
   pages.style.transform = ""; pages.style.transformOrigin = "";
   var t = tab(); if (!t) return;
+  /* 2) apply the new zoom to the document (the pages only — never the app) */
   t.zoom = clamp(p.z0 * p.ratio, 0.1, 4);
   t.zoomMode = "manual";
+  updateRail();
+  /* 3) re-render the pages sharp at the new zoom */
   await renderViewer();
+  /* 4) keep the pinch centre in view: the document point that sat under
+        the fingers goes back to the same spot in the viewport */
   var wrap = $("viewerScroll");
-  wrap.scrollLeft = p.fx * wrap.scrollWidth - wrap.clientWidth / 2;
-  wrap.scrollTop = p.fy * wrap.scrollHeight - wrap.clientHeight / 2;
+  wrap.scrollLeft = Math.max(0, p.fx * wrap.scrollWidth - p.vx);
+  wrap.scrollTop = Math.max(0, p.fy * wrap.scrollHeight - p.vy);
 }
-$("viewerScroll").addEventListener("pointerup", endPinch);
-$("viewerScroll").addEventListener("pointercancel", endPinch);
+$("viewerScroll").addEventListener("pointerup", commitPinchZoom);
+$("viewerScroll").addEventListener("pointercancel", commitPinchZoom);
 /* ================================================================
    OCR pipeline — the test-bench pipeline, unchanged.
    ================================================================ */
@@ -2410,27 +2431,45 @@ $("boxesToggleBtn").addEventListener("click", function(){
   document.querySelectorAll(".overlay").forEach(function(o){ o.classList.toggle("hide-boxes", !A.showBoxes); });
 });
 /* ================= find (global, punctuation-tolerant) ================= */
+/* COLLECTION: build the match list for the WHOLE document. The outer loop
+   walks every page of the tab in order — page 0 through the last page,
+   never just the page on screen — and the inner loop walks every word
+   recognised on that page. A.findMatches therefore holds each match in
+   the document, in reading order, each tagged with its page, and Find
+   Next / Find Previous (stepFind) simply step through this one list. */
 function searchAllPages(query){
   var t = tab(); if (!t || !query) return [];
   var qparts = query.split(/\s+/).map(normWord).filter(Boolean);
   if (!qparts.length) return [];
   var matches = [];
-  Object.keys(t.pagesWords).map(Number).sort(function(a,b){return a-b;}).forEach(function(p){
-    var words = t.pagesWords[p];
-    var norms = words.map(function(w){ return normWord(w.text); });
+  /* --- collection loop: EVERY page, in document order --- */
+  for (var p = 0; p < t.numPages; p++){
+    var words = t.pagesWords[p] || [];   /* a page not read yet has no words yet */
+    if (!words.length) continue;
     if (qparts.length === 1){
-      words.forEach(function(w, i){ if (norms[i].indexOf(qparts[0]) >= 0) matches.push({ page: p, word_index: i }); });
+      /* single word (or part-word): test every word recognised on this page */
+      for (var i = 0; i < words.length; i++){
+        if (normWord(words[i].text).indexOf(qparts[0]) >= 0)
+          matches.push({ page: p, word_index: i });
+      }
     } else {
+      /* phrase: test every run of consecutive words on each line of this page */
       var lines = t.pagesLines[p] || groupLines(words);
       lines.forEach(function(line){
-        for (var i = 0; i + qparts.length <= line.length; i++){
+        for (var s = 0; s + qparts.length <= line.length; s++){
           var ok = true;
-          for (var k = 0; k < qparts.length; k++) if (normWord(line[i+k].text) !== qparts[k]) { ok = false; break; }
-          if (ok) for (var j = 0; j < qparts.length; j++) matches.push({ page: p, word_index: words.indexOf(line[i+j]) });
+          for (var k = 0; k < qparts.length; k++)
+            if (normWord(line[s+k].text) !== qparts[k]) { ok = false; break; }
+          if (ok){
+            for (var j = 0; j < qparts.length; j++){
+              var wi = words.indexOf(line[s+j]);
+              if (wi >= 0) matches.push({ page: p, word_index: wi });
+            }
+          }
         }
       });
     }
-  });
+  }
   return matches;
 }
 function clearFindMarks(){
@@ -2461,20 +2500,61 @@ function runFind(){
   if (unread) status('Found ' + A.findMatches.length + ' so far — still reading ' + unread + (unread === 1 ? " page" : " pages") + ', so the count may grow.');
   showFindMatch();
 }
-function showFindMatch(){
+/* Show the current match (A.findMatches[A.findIdx]): jump to its page
+   when it is on another page, scroll it into the middle of the viewer,
+   and highlight it there. The list is in document order (see the
+   collection loop in searchAllPages), so stepping walks the whole
+   document from the first match to the last and wraps around. */
+async function showFindMatch(){
   var m = A.findMatches[A.findIdx]; if (!m) return;
+  var t = tab(); if (!t) return;
   $("findCount").textContent = (A.findIdx + 1) + " of " + A.findMatches.length;
-  var t = tab();
+  /* --- jump to the match's page when it is not the page on screen --- */
+  if (t.viewMode === "single" && t.pageNum !== m.page + 1){
+    t.pageNum = m.page + 1;
+    A.selection = {};
+    await renderViewer();   /* wait until that page is rendered, then scroll */
+    refreshOcrPanel(); markThumbCurrent();
+  }
+  /* --- highlight: every match gets a mark, the current one stronger --- */
   document.querySelectorAll(".wbox.found").forEach(function(b){ b.classList.remove("found"); });
   A.findMatches.forEach(function(mm){
     var w = (t.pagesWords[mm.page] || [])[mm.word_index];
     if (w && w._box) w._box.classList.add("found");
   });
   repaintFindHl();
-  flashWord(m.page, m.word_index);
+  /* --- scroll to the match, on whichever page it lives --- */
+  scrollToFindMatch(m);
+}
+/* Scroll the viewer so the match word sits in the middle of the visible
+   area, and flash its box. In Continuous view every page is rendered, so
+   this reaches a match on any page directly; in Single Page view
+   showFindMatch has already rendered the match's page first. */
+function scrollToFindMatch(m){
+  var t = tab(); if (!t) return;
+  var w = (t.pagesWords[m.page] || [])[m.word_index]; if (!w) return;
+  var slot = document.querySelector('.page-slot[data-page="' + (m.page + 1) + '"]');
+  var frame = slot ? slot.querySelector(".page-frame") : null;
+  var wrap = $("viewerScroll");
+  if (frame && wrap){
+    var fr = frame.getBoundingClientRect(), wr = wrap.getBoundingClientRect();
+    var targetTop = wrap.scrollTop + (fr.top - wr.top)
+      + (w.y0 + w.y1) / 2 * fr.height - wrap.clientHeight / 2;
+    var targetLeft = wrap.scrollLeft + (fr.left - wr.left)
+      + (w.x0 + w.x1) / 2 * fr.width - wrap.clientWidth / 2;
+    wrap.scrollTo({ top: Math.max(0, targetTop), left: Math.max(0, targetLeft), behavior: "smooth" });
+    if (t.viewMode === "continuous" && t.pageNum !== m.page + 1){
+      t.pageNum = m.page + 1; updateRail(); markThumbCurrent(); refreshOcrPanel();
+    }
+  }
+  if (w._box){
+    w._box.classList.add("flash");
+    setTimeout(function(){ if (w._box) w._box.classList.remove("flash"); }, 1600);
+  }
 }
 function stepFind(dir){
   if (!A.findMatches.length){ runFind(); return; }
+  /* walk the whole-document match list in order, wrapping at both ends */
   A.findIdx = (A.findIdx + dir + A.findMatches.length) % A.findMatches.length;
   showFindMatch();
 }
