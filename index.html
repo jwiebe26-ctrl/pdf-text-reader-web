@@ -2,7 +2,7 @@
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
 <meta name="color-scheme" content="dark light" />
 <link rel="icon" href="data:," />
 <title>PDF Text Reader</title>
@@ -168,13 +168,6 @@
   .progress-track{height:7px;border-radius:99px;background:var(--chip);overflow:hidden}
   .progress-fill{height:100%;width:0%;background:var(--accent);transition:width .2s}
   .progress-label{font-size:12px;color:var(--sub);margin-top:4px}
-  .log{
-    margin:8px 12px 0;padding:8px 10px;background:var(--input);border:1px solid var(--line-soft);
-    border-radius:7px;font-size:11.8px;line-height:1.6;color:var(--sub);
-    max-height:150px;overflow-y:auto;display:none;list-style:none;
-  }
-  .log.on{display:block}
-  .log li b{color:var(--text)}
   .score-line{font-size:13px;margin-top:8px;display:none}
   .score-line.on{display:block}
   .recent-list{font-size:13px}
@@ -183,7 +176,7 @@
 
   /* viewer */
   .viewer-wrap{flex:1;position:relative;min-width:0;display:flex;flex-direction:column;background:var(--viewer)}
-  .viewer-scroll{flex:1;overflow:auto;padding:26px 20px 60px;scrollbar-width:thin}
+  .viewer-scroll{flex:1;overflow:auto;padding:26px 20px 60px;scrollbar-width:thin;touch-action:pan-x pan-y}
   .page-slot{margin:0 auto 22px;position:relative;width:fit-content}
   .page-frame{position:relative;background:#fff;box-shadow:var(--shadow);line-height:0}
   .page-frame canvas.pagecv{display:block}
@@ -193,7 +186,14 @@
   .wbox.flash{outline:3px solid var(--accent);outline-offset:1px;z-index:5}
   .wbox.found{outline:2.5px solid var(--amber-strong);outline-offset:0;z-index:4;background:var(--amber-bg)}
   .wbox.selected{outline:2.5px solid #4d8fd1;outline-offset:0;background:var(--sel);z-index:4}
-  .overlay.hide-boxes .wbox{display:none}
+  /* boxes off: invisible but still clickable, so Select / Edit Text keep working;
+     hovering a word reveals just that word's box */
+  .overlay.hide-boxes .wbox{border-color:transparent;background:transparent}
+  .overlay.hide-boxes .wbox:hover{border-color:var(--box);background:var(--good-bg)}
+  .overlay.hide-boxes .wbox.low:hover{border-color:var(--amber-strong);background:var(--amber-bg)}
+  /* find highlights are drawn separately so matches stay visible with boxes off */
+  .findhl{position:absolute;background:rgba(224,164,88,.30);outline:2px solid var(--amber-strong);outline-offset:0;border-radius:2px;pointer-events:none;z-index:3}
+  .findhl.cur{background:rgba(224,164,88,.55);outline:3px solid var(--amber-strong);z-index:4}
   .annot{position:absolute;pointer-events:none}
   .annot.hl{background:rgba(255,235,59,.45)}
   .annot.ul{border-bottom:2.5px solid var(--box)}
@@ -390,8 +390,8 @@
     <button type="button" data-act="delPage">Delete Current Page</button>
   </div>
   <div class="menu" id="viewMenu" style="left:104px">
-    <button type="button" data-act="viewSingle"><span class="tick" data-tick="single">✓</span>Single Page</button>
-    <button type="button" data-act="viewCont"><span class="tick" data-tick="continuous"></span>Continuous</button>
+    <button type="button" data-act="viewSingle"><span class="tick" data-tick="single"></span>Single Page</button>
+    <button type="button" data-act="viewCont"><span class="tick" data-tick="continuous">✓</span>Continuous</button>
     <hr/>
     <button type="button" data-act="zoomFitPage"><span class="tick" data-tick="fit_page"></span>Fit Page <span class="acc">Ctrl+0</span></button>
     <button type="button" data-act="zoomActual"><span class="tick" data-tick="actual"></span>Actual Size <span class="acc">Ctrl+1</span></button>
@@ -402,7 +402,7 @@
     <button type="button" data-act="toolSelect"><span class="tick" data-tick="tool-select"></span>Select Tool <span class="acc">V</span></button>
     <button type="button" data-act="toolHand"><span class="tick" data-tick="tool-hand"></span>Hand Tool <span class="acc">H</span></button>
     <hr/>
-    <button type="button" data-act="toggleBoxes"><span class="tick" id="tickBoxes">✓</span>Show Word Boxes</button>
+    <button type="button" data-act="toggleBoxes"><span class="tick" id="tickBoxes"></span>Show Word Boxes</button>
     <button type="button" data-act="toggleLeft">All tools panel</button>
     <button type="button" data-act="toggleRight">Pages panel</button>
     <button type="button" data-act="toggleTheme">Dark / light mode</button>
@@ -466,14 +466,13 @@
       <div class="recog mono" id="recogText">Open a file and the words found on the page will appear here. Amber words scored under 70% — check those.</div>
       <div class="btnrow">
         <button class="btn" id="copyTextBtn" type="button">Copy page text</button>
-        <button class="btn" id="boxesToggleBtn" type="button">Word boxes: On</button>
+        <button class="btn" id="boxesToggleBtn" type="button">Word boxes: Off</button>
       </div>
     </div>
     <div class="progress-wrap" id="progressWrap">
       <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
       <div class="progress-label" id="progressLabel"></div>
     </div>
-    <ol class="log mono" id="runLog" aria-label="Reading log"></ol>
 
     <div class="lp-sec">Tools</div>
     <button class="toolrow" type="button" data-toolrow="export"><span class="tic">⇪</span>Export a PDF<span class="chev">›</span></button>
@@ -538,7 +537,7 @@
       <div id="viewerPages"></div>
       <div class="empty-view" id="emptyView">
         <h2>Open a PDF to begin</h2>
-        <p>Scanned pages are read automatically — every word gets a box, the unsure ones turn amber, and you can export a searchable PDF that looks exactly like the original.</p>
+        <p>Scanned pages are read automatically. The page stays clean — no boxes drawn over it — and you can export a searchable PDF that looks exactly like the original. (View ▸ Show Word Boxes turns the word boxes on whenever you want them; the unsure words show amber.)</p>
         <div class="empty-actions">
           <button class="btn primary" id="emptyOpen" type="button" style="flex:none">Open a PDF or image</button>
           <button class="btn" id="emptyTest" type="button">Try the test drawing</button>
@@ -707,7 +706,7 @@ var A = {
   tabs: [], activeId: null, nextId: 1,
   tool: "select",            // select|hand|edit_text|add_text|note|draw|sign_place
   preset: "engineering",
-  showBoxes: true,
+  showBoxes: false,
   ink: "Green",
   rightPane: "pages",
   running: false, cancelled: false, worker: null,
@@ -752,13 +751,11 @@ $("confirmYes").addEventListener("click", function(){
 document.querySelectorAll("[data-close]").forEach(function(b){
   b.addEventListener("click", function(){ $(b.getAttribute("data-close")).classList.remove("on"); });
 });
-function logLine(html){
-  var log = $("runLog"); log.classList.add("on");
-  var li = document.createElement("li"); li.innerHTML = html;
-  log.appendChild(li); log.scrollTop = log.scrollHeight;
-  while (log.children.length > 120) log.removeChild(log.firstChild);
-}
-function clearLog(){ $("runLog").innerHTML = ""; }
+/* The verbose run log was removed from the panel at Jake's request — the
+   progress bar and status line carry the useful information. These stay as
+   no-ops so the reading pipeline can keep its instrumentation calls. */
+function logLine(){}
+function clearLog(){}
 function setProgress(pct, label){
   var w = $("progressWrap");
   if (pct === null){ w.classList.remove("on"); return; }
@@ -891,8 +888,8 @@ function refreshViewTicks(){
   var t = tab();
   document.querySelectorAll("[data-tick]").forEach(function(el){
     var k = el.getAttribute("data-tick"), on = false;
-    if (k === "single") on = !t || t.viewMode === "single";
-    if (k === "continuous") on = !!t && t.viewMode === "continuous";
+    if (k === "single") on = !!t && t.viewMode === "single";
+    if (k === "continuous") on = !t || t.viewMode === "continuous";
     if (k === "fit_page" || k === "fit_width" || k === "actual") on = !!t && t.zoomMode === k;
     if (k === "tool-select") on = A.tool === "select";
     if (k === "tool-hand") on = A.tool === "hand";
@@ -909,7 +906,7 @@ function blankTabState(name){
     numPages: 0, pageNum: 1,
     pagesWords: {}, pagesSource: {}, pagesLines: {}, corrections: {},
     annotations: [], deletedRects: {}, formValues: {}, editedPages: {},
-    viewMode: "single", zoomMode: "fit_width", zoom: 1,
+    viewMode: "continuous", zoomMode: "fit_width", zoom: 1,
     dirty: false, isTest: false, ocrDone: false, bookmarks: null,
     renderToken: 0
   };
@@ -1238,6 +1235,7 @@ async function renderPageSlot(t, pageNum, host){
   var pageIdx = pageNum - 1;
   if (t.kind === "image"){
     var sc = await imageDisplayScale(t);
+    t._lastScale = sc;
     canvas.width = Math.round(t.imageCanvas.width * sc);
     canvas.height = Math.round(t.imageCanvas.height * sc);
     var ctx = canvas.getContext("2d");
@@ -1247,6 +1245,7 @@ async function renderPageSlot(t, pageNum, host){
   } else {
     var page = await t.pdfDoc.getPage(pageNum);
     var scale = await displayScale(t, page);
+    t._lastScale = scale;
     var dpr = Math.min(2, window.devicePixelRatio || 1);
     var vp = page.getViewport({ scale: scale * dpr });
     canvas.width = Math.round(vp.width); canvas.height = Math.round(vp.height);
@@ -1348,11 +1347,35 @@ function drawOverlay(t, pageIdx, overlay, frame){
     w._box = b;
     overlay.appendChild(b);
   });
-  /* find highlights */
-  A.findMatches.forEach(function(m){
+  /* find highlights — separate elements, visible whether word boxes are on or off */
+  A.findMatches.forEach(function(m, mi){
     if (m.page !== pageIdx) return;
     var w = (t.pagesWords[pageIdx] || [])[m.word_index];
-    if (w && w._box) w._box.classList.add("found");
+    if (!w) return;
+    if (w._box) w._box.classList.add("found");
+    addFindHl(overlay, w, mi === A.findIdx);
+  });
+}
+function addFindHl(overlay, w, isCur){
+  var d = document.createElement("div");
+  d.className = "findhl" + (isCur ? " cur" : "");
+  d.style.left = (w.x0*100)+"%"; d.style.top = (w.y0*100)+"%";
+  d.style.width = (Math.max(0.004, w.x1-w.x0)*100)+"%";
+  d.style.height = (Math.max(0.004, w.y1-w.y0)*100)+"%";
+  overlay.appendChild(d);
+}
+/* rebuild the find highlights on every rendered page (keeps the "current
+   match" marker right when stepping through matches without a re-render) */
+function repaintFindHl(){
+  var t = tab(); if (!t) return;
+  document.querySelectorAll(".overlay").forEach(function(ov){
+    ov.querySelectorAll(".findhl").forEach(function(el){ el.remove(); });
+    var pageIdx = +ov.dataset.page - 1;
+    A.findMatches.forEach(function(m, mi){
+      if (m.page !== pageIdx) return;
+      var w = (t.pagesWords[pageIdx] || [])[m.word_index];
+      if (w) addFindHl(ov, w, mi === A.findIdx);
+    });
   });
 }
 function relPos(ev, frame){
@@ -1506,14 +1529,25 @@ function drawLiveInk(ds){
 function flashWord(pageIdx, idx){
   var t = tab(); if (!t) return;
   if (t.viewMode === "single" && t.pageNum !== pageIdx + 1){ gotoPage(pageIdx + 1); }
+  /* Scroll by geometry, not via the word's box element: the box may be
+     invisible (boxes off) or not rendered yet after a page change. */
   setTimeout(function(){
     var w = (t.pagesWords[pageIdx] || [])[idx];
-    if (w && w._box){
+    if (!w) return;
+    var slot = document.querySelector('.page-slot[data-page="' + (pageIdx + 1) + '"]');
+    var frame = slot ? slot.querySelector(".page-frame") : null;
+    var wrap = $("viewerScroll");
+    if (frame && wrap){
+      var fr = frame.getBoundingClientRect(), wr = wrap.getBoundingClientRect();
+      var target = wrap.scrollTop + (fr.top - wr.top)
+        + (w.y0 + w.y1) / 2 * fr.height - wrap.clientHeight / 2;
+      wrap.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    }
+    if (w._box){
       w._box.classList.add("flash");
-      w._box.scrollIntoView({ block: "center", behavior: "smooth" });
       setTimeout(function(){ w._box.classList.remove("flash"); }, 1600);
     }
-  }, t.viewMode === "single" ? 120 : 0);
+  }, t.viewMode === "single" ? 300 : 40);
 }
 /* ================= inline editor ================= */
 function openEditor(ctx){
@@ -1664,13 +1698,19 @@ function debounceRender(){
   clearTimeout(renderDebounce);
   renderDebounce = setTimeout(function(){ renderViewer(); }, 220);
 }
+/* the zoom factor the pages are actually displayed at right now, in the
+   app's own units (1 = actual size), measured from the last render — so
+   zooming always starts from what is on screen, whatever the zoom mode */
+function currentZoomFactor(t){
+  if (t._lastScale) return t.kind === "image" ? t._lastScale : t._lastScale / (96 / 72);
+  if (t.zoomMode === "manual") return t.zoom;
+  if (t.zoomMode === "actual") return 1;
+  return 0.75;
+}
 function zoomStep(f){
   var t = tab(); if (!t) return;
-  if (t.zoomMode !== "manual"){
-    t.zoom = t.zoomMode === "actual" ? 1 : 0.75;
-    t.zoomMode = "manual";
-  }
-  t.zoom = clamp(t.zoom * f, 0.1, 4);
+  t.zoom = clamp(currentZoomFactor(t) * f, 0.1, 4);
+  t.zoomMode = "manual";
   renderViewer();
 }
 function setZoomMode(mode){
@@ -1704,6 +1744,70 @@ $("viewerScroll").addEventListener("scroll", function(){
     }
   }
 });
+/* ================= zoom belongs to the document, not the app =================
+   Every zoom path (buttons, slider, Fit, Ctrl +/−, Ctrl+wheel, pinch) scales
+   the PDF pages only; the menus, panels and layout never change size. */
+/* Ctrl+wheel over the viewer — and trackpad pinch, which browsers report as
+   Ctrl+wheel — zooms the document instead of the browser page. */
+$("viewerWrap").addEventListener("wheel", function(e){
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  if (!tab()) return;
+  zoomStep(e.deltaY < 0 ? 1.12 : 1 / 1.12);
+}, { passive: false });
+/* iOS Safari reports pinch as gesture events — stop them zooming the app;
+   the pointer-based pinch below zooms the document instead. */
+document.addEventListener("gesturestart", function(e){ e.preventDefault(); });
+document.addEventListener("gesturechange", function(e){ e.preventDefault(); });
+/* Touch pinch on the document: the pages scale live under the fingers via a
+   CSS transform, then the zoom commits and the pages re-render sharp. */
+var pinchPts = new Map(), pinch = null;
+function pinchList(){ return Array.from(pinchPts.values()); }
+function pinchDist(){ var p = pinchList(); return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y); }
+$("viewerScroll").addEventListener("pointerdown", function(e){
+  if (e.pointerType !== "touch") return;
+  pinchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinchPts.size === 2){
+    var t = tab(); if (!t) return;
+    var p = pinchList(), pages = $("viewerPages"), wrap = $("viewerScroll");
+    var mid = { x: (p[0].x + p[1].x) / 2, y: (p[0].y + p[1].y) / 2 };
+    var r = pages.getBoundingClientRect(), wr = wrap.getBoundingClientRect();
+    var ox = mid.x - r.left, oy = mid.y - r.top;
+    pinch = {
+      d0: Math.max(20, pinchDist()), z0: currentZoomFactor(t), ratio: 1,
+      ox: ox, oy: oy,
+      fx: (wrap.scrollLeft + (r.left - wr.left) + ox) / Math.max(1, wrap.scrollWidth),
+      fy: (wrap.scrollTop + (r.top - wr.top) + oy) / Math.max(1, wrap.scrollHeight)
+    };
+    dragState = null; /* a second finger cancels any tool drag in progress */
+  }
+});
+$("viewerScroll").addEventListener("pointermove", function(e){
+  if (!pinchPts.has(e.pointerId)) return;
+  pinchPts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinch && pinchPts.size === 2){
+    pinch.ratio = clamp(pinchDist() / pinch.d0, 0.2, 5);
+    var pages = $("viewerPages");
+    pages.style.transformOrigin = pinch.ox + "px " + pinch.oy + "px";
+    pages.style.transform = "scale(" + pinch.ratio + ")";
+  }
+});
+async function endPinch(e){
+  if (e && e.pointerId != null) pinchPts.delete(e.pointerId);
+  if (!pinch || pinchPts.size >= 2) return;
+  var p = pinch; pinch = null;
+  var pages = $("viewerPages");
+  pages.style.transform = ""; pages.style.transformOrigin = "";
+  var t = tab(); if (!t) return;
+  t.zoom = clamp(p.z0 * p.ratio, 0.1, 4);
+  t.zoomMode = "manual";
+  await renderViewer();
+  var wrap = $("viewerScroll");
+  wrap.scrollLeft = p.fx * wrap.scrollWidth - wrap.clientWidth / 2;
+  wrap.scrollTop = p.fy * wrap.scrollHeight - wrap.clientHeight / 2;
+}
+$("viewerScroll").addEventListener("pointerup", endPinch);
+$("viewerScroll").addEventListener("pointercancel", endPinch);
 /* ================================================================
    OCR pipeline — the test-bench pipeline, unchanged.
    ================================================================ */
@@ -2212,9 +2316,11 @@ async function runOcrTab(t){
     setProgress(100, "Done.");
     setTimeout(function(){ setProgress(null); }, 1400);
     if (tab() === t){
-      status("Reading finished — " + totalWords + " words found. Amber boxes are the ones to check; Save or Export makes the searchable PDF.");
+      status("Reading finished — " + totalWords + " words found across " + t.numPages + (t.numPages === 1 ? " page" : " pages") + ". Review low-confidence checks the unsure words; Save or Export makes the searchable PDF.");
       refreshOcrPanel();
       if (A.rightPane === "pages") refreshSidePanel();
+      /* if a Find is active, refresh it now that every page has words */
+      if ($("findInput").value.trim() && $("findInput").value.trim() === A.findQuery) runFind();
     }
   } catch (err){
     if (A.cancelled || (err && err.message === "cancelled")){
@@ -2223,7 +2329,7 @@ async function runOcrTab(t){
       setProgress(null);
     } else {
       logLine("<b>Something stopped the reading:</b> " + esc(err && err.message ? err.message : String(err)));
-      status("The reading did not finish — see the log in the tools panel. You can press Start OCR to try again.");
+      status("The reading did not finish: " + (err && err.message ? err.message : String(err)) + " You can press Start OCR to try again.");
       setProgress(null);
     }
   } finally {
@@ -2327,14 +2433,32 @@ function searchAllPages(query){
   });
   return matches;
 }
+function clearFindMarks(){
+  document.querySelectorAll(".wbox.found").forEach(function(b){ b.classList.remove("found"); });
+  document.querySelectorAll(".findhl").forEach(function(el){ el.remove(); });
+}
 function runFind(){
   var q = $("findInput").value.trim();
   A.findQuery = q;
-  document.querySelectorAll(".wbox.found").forEach(function(b){ b.classList.remove("found"); });
+  clearFindMarks();
   A.findMatches = searchAllPages(q);
   A.findIdx = A.findMatches.length ? 0 : -1;
   if (!q){ $("findCount").textContent = ""; return; }
-  if (!A.findMatches.length){ $("findCount").textContent = "No matches"; status('No matches for "' + q + '" in the pages read so far.'); return; }
+  /* Find covers the whole document: if some pages have not been read yet,
+     read them now so their words join the search (results refresh when the
+     reading finishes). */
+  var t = tab();
+  var unread = 0;
+  if (t){ for (var p = 0; p < t.numPages; p++) if (!t.pagesWords[p]) unread++; }
+  if (unread && !A.running){ queueOcr(t.id); }
+  if (!A.findMatches.length){
+    $("findCount").textContent = "No matches";
+    status(unread
+      ? 'No matches for "' + q + '" in the pages read so far — reading the other ' + unread + (unread === 1 ? " page" : " pages") + ' so Find can search the whole document…'
+      : 'No matches for "' + q + '" anywhere in this document.');
+    return;
+  }
+  if (unread) status('Found ' + A.findMatches.length + ' so far — still reading ' + unread + (unread === 1 ? " page" : " pages") + ', so the count may grow.');
   showFindMatch();
 }
 function showFindMatch(){
@@ -2343,10 +2467,10 @@ function showFindMatch(){
   var t = tab();
   document.querySelectorAll(".wbox.found").forEach(function(b){ b.classList.remove("found"); });
   A.findMatches.forEach(function(mm){
-    if (mm.page !== m.page) return;
     var w = (t.pagesWords[mm.page] || [])[mm.word_index];
     if (w && w._box) w._box.classList.add("found");
   });
+  repaintFindHl();
   flashWord(m.page, m.word_index);
 }
 function stepFind(dir){
@@ -2361,7 +2485,7 @@ $("findInput").addEventListener("keydown", function(e){
   if (e.key === "Enter"){ e.preventDefault(); if (e.shiftKey) stepFind(-1); else if (A.findQuery === $("findInput").value.trim() && A.findMatches.length) stepFind(1); else runFind(); }
 });
 $("findInput").addEventListener("input", function(){
-  if (!$("findInput").value.trim()){ A.findMatches = []; A.findIdx = -1; $("findCount").textContent = ""; document.querySelectorAll(".wbox.found").forEach(function(b){ b.classList.remove("found"); }); }
+  if (!$("findInput").value.trim()){ A.findMatches = []; A.findIdx = -1; A.findQuery = ""; $("findCount").textContent = ""; clearFindMarks(); }
 });
 /* ================= review low-confidence ================= */
 function openReview(){
@@ -2962,6 +3086,7 @@ function showHelp(which){
       "<tr><td>Ctrl+P</td><td>Print — opens the searchable copy in a new tab</td></tr>" +
       "<tr><td>Ctrl+0 / 1 / 2</td><td>Fit Page / Actual Size / Fit Width</td></tr>" +
       "<tr><td>Ctrl+ + / Ctrl+ −</td><td>Zoom in / out</td></tr>" +
+      "<tr><td>Ctrl + scroll, or pinch</td><td>Zoom the document — the pages only, the app stays the same size</td></tr>" +
       "<tr><td>Page Up / Page Down</td><td>Previous / next page</td></tr>" +
       "<tr><td>Home / End</td><td>First / last page</td></tr>" +
       "<tr><td>← / → ↑ / ↓</td><td>Scroll the page (previous / next page at the ends in Single view)</td></tr>" +
@@ -2972,7 +3097,7 @@ function showHelp(which){
   } else {
     $("helpTitle").textContent = "About PDF Text Reader";
     $("helpBody").innerHTML =
-      "<p><b>PDF Text Reader</b> reads scanned PDFs and drawings right in your browser: it cleans each page (straightens it, whitens a dark scanner edge, stretches the contrast), reads it, boxes every word — green when it is sure, amber under 70% — and exports a searchable PDF with the original pages untouched and the words in an invisible layer.</p>" +
+      "<p><b>PDF Text Reader</b> reads scanned PDFs and drawings right in your browser: it cleans each page (straightens it, whitens a dark scanner edge, stretches the contrast), reads every word, and exports a searchable PDF with the original pages untouched and the words in an invisible layer. Word boxes are off by default so the page stays clean — turn them on any time with View ▸ Show Word Boxes (green when it is sure, amber under 70%). Pages scroll continuously, like Adobe: just scroll down to reach the next page, and Find searches the whole document, not just the page on screen.</p>" +
       "<p>It also edits: change or add text, fill form fields, place a drawn signature (not a certified digital signature), highlight, underline, strike out, leave sticky notes, draw freehand, and rotate or delete pages.</p>" +
       "<p>Everything runs on this device. Files are never uploaded; the only downloads are the free reading and PDF libraries the page itself is built from. Recent files and your signature are kept in this browser only, so you can reopen them here.</p>" +
       "<p>One honest limit: a browser cannot save over the original file on disk, so Save downloads the edited copy and your original stays untouched.</p>";
