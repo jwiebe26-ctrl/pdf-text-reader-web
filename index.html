@@ -353,7 +353,7 @@
   <button class="mbtn" data-menu="viewMenu" type="button">View</button>
   <button class="mbtn" data-menu="helpMenu" type="button">Help</button>
   <div class="spacer"></div>
-  <span class="appnote">PDF Text Reader — everything runs in your browser; files are never uploaded.</span>
+  <span class="appnote" id="appNote">PDF Text Reader — everything runs in your browser; files are never uploaded.</span>
 
   <div class="menu" id="fileMenu" style="left:8px">
     <button type="button" data-act="open">Open PDF or image… <span class="acc">Ctrl+O</span></button>
@@ -448,7 +448,13 @@
 
     <div class="lp-sec">Scan &amp; OCR</div>
     <div class="lp-body">
-      <label for="presetSel" style="font-size:12.5px;color:var(--sub);display:block;margin-bottom:4px">Preset</label>
+      <label for="readingModeSel" style="font-size:12.5px;color:var(--sub);display:block;margin-bottom:4px">Reading:</label>
+      <select id="readingModeSel">
+        <option value="local">On this computer</option>
+        <option value="server" selected>On the server</option>
+      </select>
+      <div class="preset-desc" id="readingModeNote"></div>
+      <label for="presetSel" style="font-size:12.5px;color:var(--sub);display:block;margin-bottom:4px;margin-top:10px">Preset</label>
       <select id="presetSel">
         <option value="engineering" selected>Engineering Drawing</option>
         <option value="general">General Document</option>
@@ -527,7 +533,7 @@
       <div class="recent-list" id="recentList"><div style="padding:4px 8px;color:var(--faint)">No recent files yet.</div></div>
     </div>
     <div class="lp-body" style="margin-top:14px">
-      <div class="dlg-note">Files open from this device only and are read right here — nothing is uploaded or stored on a server. Recent files are kept in this browser so you can reopen them.</div>
+      <div class="dlg-note" id="privacyNote">Files open from this device only and are read right here — nothing is uploaded or stored on a server. Recent files are kept in this browser so you can reopen them.</div>
     </div>
   </aside>
 
@@ -710,6 +716,8 @@ var A = {
   ink: "Green",
   rightPane: "pages",
   running: false, cancelled: false, pool: null, poolPromise: null,
+  readingMode: "server",     // "server" | "local" — restored from this browser below
+  serverAbort: null,         // AbortController of the in-flight server request, if any
   ocrQueue: [],              // tab ids waiting for OCR
   findMatches: [], findIdx: -1, findQuery: "",
   signature: null,           // dataURL PNG of the saved signature
@@ -2345,6 +2353,144 @@ async function ocrTabPage(t, pageNum, slot, report){
   void pageIdx;
   return { words: finalWords, source: sourceLabel, lines: lineGroups, corrections: corrections };
 }
+/* ================= server reading =================
+   In server mode the PDF is sent to the reading server in small
+   batches — the page on screen first, then the rest in document
+   order, a few pages per request — and every returned page is stored
+   in exactly the same word store the local reader fills, so Find,
+   highlights, low-confidence review, Copy page text and the exports
+   all work the same. The server deletes the file as soon as it has
+   read it. The free server sleeps when idle, so the first request
+   can take a while: it gets a long timeout and one retry while
+   "Waking the server…" shows, and if it still does not answer, the
+   caller falls back to reading the remaining pages on this computer. */
+var SERVER_API = "https://pdf-text-reader-api.onrender.com";
+var SERVER_TIMEOUT_MS = 120000;
+var SERVER_BATCH_PAGES = 3;
+function buildServerBatches(todo){
+  /* todo is in reading order (current page first, then the rest in
+     document order). The current page goes on its own so it comes
+     back fast; the rest go in runs of consecutive pages, up to
+     SERVER_BATCH_PAGES per request, each sent as one page range. */
+  var batches = [];
+  if (!todo.length) return batches;
+  batches.push([todo[0]]);
+  var cur = [];
+  for (var i = 1; i < todo.length; i++){
+    var pg = todo[i];
+    if (cur.length && (pg !== cur[cur.length - 1] + 1 || cur.length >= SERVER_BATCH_PAGES)){
+      batches.push(cur); cur = [];
+    }
+    cur.push(pg);
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+async function serverOcrBatch(t, pages){
+  var ctl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  A.serverAbort = ctl;
+  var timer = ctl ? setTimeout(function(){ try { ctl.abort(); } catch(e){} }, SERVER_TIMEOUT_MS) : null;
+  try {
+    var fd = new FormData();
+    fd.append("file", new Blob([t.pdfBytes], { type: "application/pdf" }), t.name || "document.pdf");
+    fd.append("preset", A.preset);
+    fd.append("pages", pages[0] + "-" + pages[pages.length - 1]);
+    var res = await fetch(SERVER_API + "/ocr", { method: "POST", body: fd, signal: ctl ? ctl.signal : undefined });
+    if (!res.ok) throw new Error("The server answered with an error (" + res.status + ").");
+    return await res.json();
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (A.serverAbort === ctl) A.serverAbort = null;
+  }
+}
+async function storeServerPage(t, pd){
+  var pageNum = pd.page, pageIdx = pageNum - 1;
+  if (pageIdx < 0 || pageIdx >= t.numPages) return;
+  var W = 0, H = 0;
+  if (t.pdfDoc){
+    var page = await t.pdfDoc.getPage(pageNum);
+    var vp = page.getViewport({ scale: 1 });
+    W = vp.width; H = vp.height;
+  } else if (t.imageCanvas){ W = t.imageCanvas.width; H = t.imageCanvas.height; }
+  if (!W || !H) return;
+  /* the server's per-page source label passes through unchanged */
+  var src = pd.source != null ? String(pd.source) : "OCR";
+  var wordSource = src === "Embedded text" ? "native" : "ocr";
+  /* the server sends word boxes in PDF points; the word store keeps
+     0–1 fractions of the page, so divide by the page's point size */
+  var words = (pd.words || []).map(function(w){
+    return {
+      text: String(w.text || ""), conf: typeof w.conf === "number" ? w.conf : 0,
+      x0: clamp((+w.x0 || 0) / W, 0, 1), y0: clamp((+w.y0 || 0) / H, 0, 1),
+      x1: clamp((+w.x1 || 0) / W, 0, 1), y1: clamp((+w.y1 || 0) / H, 0, 1),
+      source: wordSource
+    };
+  }).filter(function(w){ return !!w.text; });
+  words.sort(function(a, b){ return (a.y0 - b.y0) || (a.x0 - b.x0); });
+  var lineGroups = groupLines(words);
+  var corrections = [];
+  if (A.preset === "engineering" && src !== "Embedded text"){
+    corrections = applyCorrections(lineGroups);
+    lineGroups = groupLines(words);
+  }
+  t.pagesWords[pageIdx] = words;
+  t.pagesSource[pageIdx] = src;
+  t.pagesLines[pageIdx] = lineGroups;
+  t.corrections[pageIdx] = corrections;
+  if (tab() === t) renderViewer();
+}
+/* Read a tab's pages on the server. hooks.pageDone(pg) marks a page
+   finished (and refreshes the progress bar); hooks.pct() gives the
+   current overall percent. Returns null when every page was read —
+   or when the run was cancelled, which the caller checks through
+   A.cancelled — or the list of pages still unread when the server
+   did not answer, so the caller can read those on this computer. */
+async function readTabOnServer(t, todo, hooks){
+  var batches = buildServerBatches(todo);
+  var donePages = {};
+  var waking = true; /* until the first request has been answered */
+  for (var bi = 0; bi < batches.length; bi++){
+    if (A.cancelled) return null;
+    var batch = batches[bi];
+    var data = null;
+    for (var attempt = 0; attempt < 2 && !data; attempt++){
+      if (A.cancelled) return null;
+      if (waking){
+        setProgress(hooks.pct(), "Waking the server…");
+        status("Waking the server — the first read can take about a minute while it starts.");
+      }
+      try { data = await serverOcrBatch(t, batch); }
+      catch (err){ data = null; if (A.cancelled) return null; }
+    }
+    var wasWaking = waking;
+    waking = false;
+    if (!data){
+      return todo.filter(function(pg){ return !donePages[pg]; });
+    }
+    if (wasWaking) status("Reading on the server…");
+    var seen = {};
+    var returned = data.pages || [];
+    for (var ri = 0; ri < returned.length; ri++){
+      await storeServerPage(t, returned[ri]);
+      seen[returned[ri].page] = true;
+    }
+    for (var bj = 0; bj < batch.length; bj++){
+      var pg2 = batch[bj];
+      if (!seen[pg2]){
+        /* the server sent nothing back for this page — count it read, with no words */
+        var idx2 = pg2 - 1;
+        if (!t.pagesWords[idx2]){
+          t.pagesWords[idx2] = []; t.pagesSource[idx2] = "OCR";
+          t.pagesLines[idx2] = []; t.corrections[idx2] = [];
+        }
+      }
+      donePages[pg2] = true;
+      hooks.pageDone(pg2);
+    }
+    if (tab() === t) refreshOcrPanel();
+  }
+  return null;
+}
 /* ================= OCR queue / run ================= */
 function queueOcr(id){
   if (A.ocrQueue.indexOf(id) < 0) A.ocrQueue.push(id);
@@ -2369,13 +2515,9 @@ async function runOcrTab(t){
   logLine("<b>File:</b> " + esc(t.name) + " · " + t.numPages + (t.numPages === 1 ? " page" : " pages"));
   logLine("<b>Preset:</b> " + esc(preset.label) + " — " + esc(preset.desc));
   try {
-    var slots = await getPool();
     /* Reading order: the page on screen goes first, so it is readable
-       almost immediately; the pool then works through the remaining
-       pages in the background, in document order. Pages edited by hand
-       are skipped, as before, so the edits are kept. Each pool worker
-       pulls the next page as soon as it finishes one, so several pages
-       are always being read at once. */
+       almost immediately; the rest follow in document order. Pages
+       edited by hand are skipped, as before, so the edits are kept. */
     var startPage = clamp(t.pageNum, 1, t.numPages);
     var order = [startPage];
     for (var p = 1; p <= t.numPages; p++) if (p !== startPage) order.push(p);
@@ -2387,33 +2529,62 @@ async function runOcrTab(t){
       } else { fracs[pg] = 0; todo.push(pg); }
     });
     var doneCount = order.length - todo.length; /* hand-edited pages count as already done */
+    var serverMode = A.readingMode === "server" && !!t.pdfBytes;
+    var fellBack = false;
     var updateProgress = function(){
       var sum = 0;
       for (var pg = 1; pg <= t.numPages; pg++) sum += fracs[pg] || 0;
       var pct = t.numPages ? (sum / t.numPages) * 100 : 100;
-      setProgress(pct, "Reading… " + Math.round(pct) + "% · " + doneCount + " of " + t.numPages + (t.numPages === 1 ? " page" : " pages") + " done");
+      setProgress(pct, "Reading… " + Math.round(pct) + "% · " + doneCount + " of " + t.numPages + (t.numPages === 1 ? " page" : " pages") + " done" + (serverMode ? " · on the server" : ""));
     };
-    updateProgress();
-    var cursor = 0, firstError = null;
-    var runSlot = async function(slot){
-      while (!firstError && !A.cancelled && cursor < todo.length){
-        var pageNum = todo[cursor++];
-        try {
-          var res = await ocrTabPage(t, pageNum, slot, function(f){
-            if (f > (fracs[pageNum] || 0)){ fracs[pageNum] = f; updateProgress(); }
-          });
-          t.pagesWords[pageNum - 1] = res.words;
-          t.pagesSource[pageNum - 1] = res.source;
-          t.pagesLines[pageNum - 1] = res.lines || groupLines(res.words);
-          t.corrections[pageNum - 1] = res.corrections || [];
-          fracs[pageNum] = 1; doneCount++;
-          updateProgress();
-          if (tab() === t) renderViewer();
-        } catch (err){ if (!firstError) firstError = err; }
+    /* Local reading — the existing worker-pool path, unchanged. Each
+       pool worker pulls the next page as soon as it finishes one, so
+       several pages are always being read at once. */
+    var runLocalPages = async function(pagesList){
+      var slots = await getPool();
+      updateProgress();
+      var cursor = 0, firstError = null;
+      var runSlot = async function(slot){
+        while (!firstError && !A.cancelled && cursor < pagesList.length){
+          var pageNum = pagesList[cursor++];
+          try {
+            var res = await ocrTabPage(t, pageNum, slot, function(f){
+              if (f > (fracs[pageNum] || 0)){ fracs[pageNum] = f; updateProgress(); }
+            });
+            t.pagesWords[pageNum - 1] = res.words;
+            t.pagesSource[pageNum - 1] = res.source;
+            t.pagesLines[pageNum - 1] = res.lines || groupLines(res.words);
+            t.corrections[pageNum - 1] = res.corrections || [];
+            fracs[pageNum] = 1; doneCount++;
+            updateProgress();
+            if (tab() === t) renderViewer();
+          } catch (err){ if (!firstError) firstError = err; }
+        }
+      };
+      await Promise.all(slots.map(runSlot));
+      if (firstError) throw firstError;
+    };
+    if (serverMode){
+      updateProgress();
+      var remaining = await readTabOnServer(t, todo, {
+        pct: function(){
+          var sum = 0;
+          for (var pg = 1; pg <= t.numPages; pg++) sum += fracs[pg] || 0;
+          return t.numPages ? (sum / t.numPages) * 100 : 100;
+        },
+        pageDone: function(pg){ fracs[pg] = 1; doneCount++; updateProgress(); }
+      });
+      if (A.cancelled) throw new Error("cancelled");
+      if (remaining){
+        /* The server did not answer — read the pages it never reached
+           here, on this computer, with the usual local reader. */
+        fellBack = true;
+        serverMode = false;
+        await runLocalPages(remaining);
       }
-    };
-    await Promise.all(slots.map(runSlot));
-    if (firstError) throw firstError;
+    } else {
+      await runLocalPages(todo);
+    }
     if (A.cancelled) throw new Error("cancelled");
     t.ocrDone = true;
     var totalWords = Object.keys(t.pagesWords).reduce(function(s, k){ return s + t.pagesWords[k].length; }, 0);
@@ -2422,7 +2593,8 @@ async function runOcrTab(t){
     setProgress(100, "Done.");
     setTimeout(function(){ setProgress(null); }, 1400);
     if (tab() === t){
-      status("Reading finished — " + totalWords + " words found across " + t.numPages + (t.numPages === 1 ? " page" : " pages") + ". Review low-confidence checks the unsure words; Save or Export makes the searchable PDF.");
+      if (fellBack) status("The server didn't answer, so it read on this computer instead.");
+      else status("Reading finished — " + totalWords + " words found across " + t.numPages + (t.numPages === 1 ? " page" : " pages") + ". Review low-confidence checks the unsure words; Save or Export makes the searchable PDF.");
       refreshOcrPanel();
       if (A.rightPane === "pages") refreshSidePanel();
       /* if a Find is active, refresh it now that every page has words */
@@ -2447,6 +2619,7 @@ async function runOcrTab(t){
 }
 $("ocrCancel").addEventListener("click", async function(){
   A.cancelled = true;
+  if (A.serverAbort){ try { A.serverAbort.abort(); } catch(e){} }
   status("Stopping the reading…");
   var slots = A.pool || [];
   A.pool = null; A.poolPromise = null;
@@ -2468,6 +2641,33 @@ $("presetSel").addEventListener("change", function(){
 });
 function refreshPresetDesc(){ $("presetDesc").textContent = PRESETS[A.preset].desc; }
 refreshPresetDesc();
+/* ================= reading mode: this computer or the server =================
+   The choice is kept in this browser and restored on load. Switching
+   does not re-read anything by itself — it applies to the next Start
+   or auto-start. Server mode is the default. */
+try { A.readingMode = localStorage.getItem("ptr-reading-mode") === "local" ? "local" : "server"; } catch(e){ A.readingMode = "server"; }
+function refreshReadingModeUI(){
+  var server = A.readingMode === "server";
+  $("readingModeSel").value = server ? "server" : "local";
+  $("readingModeNote").textContent = server
+    ? "The file is sent to the server to be read, and the server deletes it right after — nothing is kept. The first read can take about a minute while the server wakes up."
+    : "Reading runs on this computer, in your browser, and the file is never uploaded.";
+  $("appNote").textContent = server
+    ? "PDF Text Reader — server reading is on: the file is sent to the server to be read, then deleted."
+    : "PDF Text Reader — everything runs in your browser; files are never uploaded.";
+  $("privacyNote").textContent = server
+    ? "In server reading mode the file is sent to the server to be read, and the server deletes it right after — nothing is stored there. Recent files are kept in this browser so you can reopen them."
+    : "Files open from this device only and are read right here — nothing is uploaded or stored on a server. Recent files are kept in this browser so you can reopen them.";
+}
+$("readingModeSel").addEventListener("change", function(){
+  A.readingMode = $("readingModeSel").value === "local" ? "local" : "server";
+  try { localStorage.setItem("ptr-reading-mode", A.readingMode); } catch(e){}
+  refreshReadingModeUI();
+  status(A.readingMode === "server"
+    ? "Reading set to the server — it applies the next time reading starts."
+    : "Reading set to this computer — it applies the next time reading starts.");
+});
+refreshReadingModeUI();
 function refreshOcrPanel(){
   var t = tab();
   var confEl = $("confLine"), recog = $("recogText"), score = $("scoreLine");
@@ -3266,9 +3466,11 @@ function showHelp(which){
   } else {
     $("helpTitle").textContent = "About PDF Text Reader";
     $("helpBody").innerHTML =
-      "<p><b>PDF Text Reader</b> reads scanned PDFs and drawings right in your browser: it cleans each page (straightens it, whitens a dark scanner edge, stretches the contrast), reads every word, and exports a searchable PDF with the original pages untouched and the words in an invisible layer. Word boxes are off by default so the page stays clean — turn them on any time with View ▸ Show Word Boxes (green when it is sure, amber under 70%). Pages scroll continuously, like Adobe: just scroll down to reach the next page, and Find searches the whole document, not just the page on screen.</p>" +
+      "<p><b>PDF Text Reader</b> reads scanned PDFs and drawings " + (A.readingMode === "server" ? "on the reading server" : "right in your browser") + ": it cleans each page (straightens it, whitens a dark scanner edge, stretches the contrast), reads every word, and exports a searchable PDF with the original pages untouched and the words in an invisible layer. Word boxes are off by default so the page stays clean — turn them on any time with View ▸ Show Word Boxes (green when it is sure, amber under 70%). Pages scroll continuously: just scroll down to reach the next page, and Find searches the whole document, not just the page on screen.</p>" +
       "<p>It also edits: change or add text, fill form fields, place a drawn signature (not a certified digital signature), highlight, underline, strike out, leave sticky notes, draw freehand, and rotate or delete pages.</p>" +
-      "<p>Everything runs on this device. Files are never uploaded; the only downloads are the free reading and PDF libraries the page itself is built from. Recent files and your signature are kept in this browser only, so you can reopen them here.</p>" +
+      (A.readingMode === "server"
+        ? "<p>Reading is set to the server: the file is sent to the reading server, read there, and deleted right after — nothing is kept. Recent files and your signature are kept in this browser only, so you can reopen them here. You can switch back to reading on this computer any time in the Scan &amp; OCR panel.</p>"
+        : "<p>Everything runs on this device. Files are never uploaded; the only downloads are the free reading and PDF libraries the page itself is built from. Recent files and your signature are kept in this browser only, so you can reopen them here.</p>") +
       "<p>One honest limit: a browser cannot save over the original file on disk, so Save downloads the edited copy and your original stays untouched.</p>";
   }
   $("helpScrim").classList.add("on");
