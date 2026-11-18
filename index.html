@@ -916,6 +916,7 @@ function blankTabState(name){
     annotations: [], deletedRects: {}, formValues: {}, editedPages: {},
     viewMode: "continuous", zoomMode: "fit_width", zoom: 1,
     dirty: false, isTest: false, ocrDone: false, bookmarks: null,
+    serverUnread: null,
     renderToken: 0
   };
 }
@@ -2363,9 +2364,11 @@ async function ocrTabPage(t, pageNum, slot, report){
    read it. The free server sleeps when idle, so the first request
    can take a while: it gets a long timeout and one retry while
    "Waking the server…" shows, and if it still does not answer, the
-   caller falls back to reading the remaining pages on this computer. */
+   run stops and the computer never takes over in server mode — the
+   unread pages are remembered on the tab so the next Start OCR
+   retries only those pages. */
 var SERVER_API = "https://pdf-text-reader-api.onrender.com";
-var SERVER_TIMEOUT_MS = 120000;
+var SERVER_TIMEOUT_MS = 300000;
 var SERVER_BATCH_PAGES = 3;
 function buildServerBatches(todo){
   /* todo is in reading order (current page first, then the rest in
@@ -2444,7 +2447,8 @@ async function storeServerPage(t, pd){
    current overall percent. Returns null when every page was read —
    or when the run was cancelled, which the caller checks through
    A.cancelled — or the list of pages still unread when the server
-   did not answer, so the caller can read those on this computer. */
+   did not answer, so the caller can record those pages and stop
+   the run without reading them on this computer. */
 async function readTabOnServer(t, todo, hooks){
   var batches = buildServerBatches(todo);
   var donePages = {};
@@ -2522,15 +2526,32 @@ async function runOcrTab(t){
     var order = [startPage];
     for (var p = 1; p <= t.numPages; p++) if (p !== startPage) order.push(p);
     var fracs = {}, todo = [];
+    /* Pages left unread by an earlier server run are remembered on
+       the tab: retry only those pages and do not re-read pages that
+       already have words. A preset change clears the remembered
+       pages (see the preset handler), so it re-reads the whole file. */
+    var rememberedUnread = (t.serverUnread && t.serverUnread.length) ? t.serverUnread.slice() : null;
     order.forEach(function(pg){
       if (t.editedPages[pg - 1]){
         logLine("<b>Page " + pg + ":</b> you edited this page by hand — reading skipped so your edits are kept.");
         fracs[pg] = 1;
+      } else if (rememberedUnread && rememberedUnread.indexOf(pg) === -1){
+        /* Already read in the earlier run — keep its words. */
+        fracs[pg] = 1;
+      } else if (rememberedUnread && t.pagesWords[pg - 1]){
+        /* Remembered as unread but it already has words — keep them. */
+        fracs[pg] = 1;
       } else { fracs[pg] = 0; todo.push(pg); }
     });
-    var doneCount = order.length - todo.length; /* hand-edited pages count as already done */
+    if (rememberedUnread){
+      /* Drop remembered pages that are no longer in the retry list
+         (hand-edited or already holding words) from the memory. */
+      t.serverUnread = todo.slice();
+      if (!t.serverUnread.length) t.serverUnread = null;
+    }
+    var doneCount = order.length - todo.length; /* hand-edited and already-read pages count as already done */
     var serverMode = A.readingMode === "server" && !!t.pdfBytes;
-    var fellBack = false;
+    var serverUnread = null;
     var updateProgress = function(){
       var sum = 0;
       for (var pg = 1; pg <= t.numPages; pg++) sum += fracs[pg] || 0;
@@ -2576,24 +2597,34 @@ async function runOcrTab(t){
       });
       if (A.cancelled) throw new Error("cancelled");
       if (remaining){
-        /* The server did not answer — read the pages it never reached
-           here, on this computer, with the usual local reader. */
-        fellBack = true;
-        serverMode = false;
-        await runLocalPages(remaining);
+        /* The server did not answer — stop the run and leave those
+           pages unread. The computer never takes over in server
+           mode. Remember the pages on the tab so the next Start OCR
+           retries only those pages. */
+        serverUnread = remaining.slice();
+        t.serverUnread = remaining.slice();
+        logLine("<b>Server did not finish:</b> page(s) " + remaining.join(", ") + " were not read. Your computer did not take over.");
+      } else {
+        t.serverUnread = null;
       }
     } else {
       await runLocalPages(todo);
+      if (!A.cancelled) t.serverUnread = null;
     }
     if (A.cancelled) throw new Error("cancelled");
-    t.ocrDone = true;
+    t.ocrDone = !serverUnread;
     var totalWords = Object.keys(t.pagesWords).reduce(function(s, k){ return s + t.pagesWords[k].length; }, 0);
     var elapsed = performance.now() - t0;
-    logLine("<b>Done</b> in " + fmtTime(elapsed) + " — " + totalWords + " words across " + t.numPages + " page(s).");
-    setProgress(100, "Done.");
-    setTimeout(function(){ setProgress(null); }, 1400);
+    if (serverUnread){
+      logLine("<b>Stopped</b> in " + fmtTime(elapsed) + " — " + totalWords + " words across " + t.numPages + " page(s); " + serverUnread.length + " page(s) not read: " + serverUnread.join(", ") + ".");
+      setProgress(null);
+    } else {
+      logLine("<b>Done</b> in " + fmtTime(elapsed) + " — " + totalWords + " words across " + t.numPages + " page(s).");
+      setProgress(100, "Done.");
+      setTimeout(function(){ setProgress(null); }, 1400);
+    }
     if (tab() === t){
-      if (fellBack) status("The server didn't answer, so it read on this computer instead.");
+      if (serverUnread) status("The server didn't finish in time — your computer did not take over. " + serverUnread.length + " page(s) were not read. Press Start OCR to try them again.");
       else status("Reading finished — " + totalWords + " words found across " + t.numPages + (t.numPages === 1 ? " page" : " pages") + ". Review low-confidence checks the unsure words; Save or Export makes the searchable PDF.");
       refreshOcrPanel();
       if (A.rightPane === "pages") refreshSidePanel();
@@ -2636,6 +2667,9 @@ $("ocrStart").addEventListener("click", function(){
 $("presetSel").addEventListener("change", function(){
   A.preset = $("presetSel").value;
   refreshPresetDesc();
+  /* Switching the preset clears the remembered unread pages on
+     every tab, so the next Start OCR re-reads the whole file. */
+  A.tabs.forEach(function(x){ x.serverUnread = null; });
   var t = tab();
   if (t) status("Preset set to " + PRESETS[A.preset].label + ". Press Start OCR to read again with it.");
 });
